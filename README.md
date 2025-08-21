@@ -12,13 +12,11 @@ There is audio output, but it needs improving.
 
 It currently uses the Europe/USA 1.3 BIOS, which, on power-up,  displays the Sega trademark and then looks for a game cartridge.
 
-Games are loaded via an On-Screen Display (OSD) overlaid on the HDMI output. The OSD is started by pressing all four direction buttons. 
-
-To run the OSD you need micropython on the ESP32, and then do `import osd`.
-
-The OSD displays a file browser showing files on the ESP32 flash memory and an SD card. You navigate to a .sms file using the direction buttons, and select it with the right button. The game should then start.
+To load games, copy `python/program.py` to your Rpi Zero installed with [circuitpython](https://learn.adafruit.com/circuitpython-on-raspberrypi-linux/installing-circuitpython-on-raspberry-pi), and run `python3 program.py <rom>.sms`.
 
 There are lots of games on the [planetemu](https://www.planetemu.net/roms/sega-master-system) site.
+
+Controls are implemented on `usb 0` (Left port) using [usb_hid_host](https://github.com/nand2mario/usb_hid_host). You can control it via wasd keys on a keyboard, and the xy keys or kl. Press P to restart. Alternativly mouse control is supported if you don't have a keyboard, left button goes left, right one right, middle button is jump (fire1). The onboard buttons are for reset and up when a mouse is plugged in. USB gamepads (not xbox controllers) are supported, their key mapping is pretty obvious :)
 
 ## Implementation
 
@@ -34,18 +32,14 @@ Top-level parameters allow the VGA output to be selected, and also LCD and LED d
 
 ## Installation
 
-You need recent versions of Yosys, nextpnr-ecp5, project trellis and fujprog.
+You need recent versions of oss cad suit.
 
 To build do:
 
 ```
-cd ulx3s
-make prog
+cd icepi-zero
+make install
 ```
-
-It currently defaults to an 85F board. To use a 12F add `DEVICE = 12k` to the Makefile.
-
-The python files from esp32/osd should be uploaded to the ESP32.
 
 ## Bugs
 

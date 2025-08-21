@@ -1,37 +1,18 @@
 `default_nettype none
-module sms
+module top
 #(
-  parameter c_vga_out     = 0, // 0; Just HDMI, 1: VGA and HDMI
-  parameter c_lcd_hex     = 0, // SPI LCD HEX decoder
   parameter c_diag        = 1, // 0: No led diagnostcs, 1: led diagnostics 
-  parameter c_volume      = 4  // Sound volume 0 - 15
 )
 (
-  input         clk_25mhz,
+  input         clk,
   // Buttons
-  input [6:0]   btn,
-  // Switches
-  input [3:0]   sw,
+  input [1:0]   button,
   // HDMI
   output [3:0]  gpdi_dp,
   output [3:0]  gpdi_dn,
-  // Keyboard
-  output        usb_fpga_pu_dp,
-  output        usb_fpga_pu_dn,
-  // Audio
-  output [3:0]  audio_l,
-  output [3:0]  audio_r,
-  // ESP32 passthru
-  input         ftdi_txd,
-  output        ftdi_rxd,
-  input         wifi_txd,
-  output        wifi_rxd,  // SPI from ESP32
-  input         wifi_gpio16,
-  input         wifi_gpio5,
-  output        wifi_gpio0,
 
   inout  sd_clk, sd_cmd,
-  inout   [3:0] sd_d,
+  inout   [3:0] sd_dat,
 
   output sdram_csn,       // chip select
   output sdram_clk,       // clock to SDRAM
@@ -42,18 +23,28 @@ module sms
   output [12:0] sdram_a,  // SDRAM address bus
   output  [1:0] sdram_ba, // SDRAM bank-address
   output  [1:0] sdram_dqm,// byte select
-  inout  [15:0] sdram_d,  // data bus to/from SDRAM
+  inout  [15:0] sdram_dq,  // data bus to/from SDRAM
 
-  inout  [27:0] gp,gn,
-  // SPI display
-  output        oled_csn,
-  output        oled_clk,
-  output        oled_mosi,
-  output        oled_dc,
-  output        oled_resn,
+  input usb_rx,
+  output usb_tx,
+  output pi_rx,
+  output pi_nirq,
+  input  pi_sclk,
+  input  pi_mosi,
+  output pi_miso,
+  input  pi_ce0,
+
+  // inout  [27:0] gpio,
   // Leds
-  output [7:0]  led
+  output [4:0]  led,
+
+  output [1:0] usb_pull_dp,
+  output [1:0] usb_pull_dn,
+  inout  [1:0] usb_dp,
+  inout  [1:0] usb_dn
 );
+  assign pi_rx = usb_rx;
+  assign usb_tx = usb_rx;
 
   // I/O ports
   wire vdp_data_port = cpuAddress[7:6] == 2 && !cpuAddress[0];
@@ -75,15 +66,7 @@ module sms
 
   reg [7:0] r_mem_ctrl;
   reg [7:0] r_joy_ctrl;
-
-  // pull-ups for us2 connector 
-  assign usb_fpga_pu_dp = 1;
-  assign usb_fpga_pu_dn = 1;
   
-  // passthru to ESP32 micropython serial console
-  assign wifi_rxd = ftdi_txd;
-  assign ftdi_rxd = wifi_txd;
-
   // VGA (should be assigned to some gp/gn outputs
   wire   [7:0]  red;
   wire   [7:0]  green;
@@ -91,22 +74,10 @@ module sms
   wire          hSync;
   wire          vSync;
   
-  generate
-    genvar i;
-    if (c_vga_out) begin
-      for(i = 0; i < 4; i = i+1) begin
-        assign gp[10-i] = blue[4+i];
-        assign gn[3-i] = green[4+i];
-        assign gn[10-i] = red[4+i];
-      end
-      assign gp[2] = vSync;
-      assign gp[3] = hSync;
-    end 
-  endgenerate
-
   // Led diagnostics
   reg [15:0] diag16;
 
+  /*
   generate 
     genvar i;
     if (c_diag) begin
@@ -118,6 +89,7 @@ module sms
       end
     end
   endgenerate
+  */
   
   // CPU registers
   wire          n_WR;
@@ -154,7 +126,7 @@ module sms
   wire [3:0] clocks;
   ecp5pll
   #(
-      .in_hz( 25*1000000),
+      .in_hz( 50*1000000),
     .out0_hz(125*1000000),
     .out1_hz( 25*1000000),
     .out2_hz(100*1000000),                // SDRAM core
@@ -162,7 +134,7 @@ module sms
   )
   ecp5pll_inst
   (
-    .clk_i(clk_25mhz),
+    .clk_i(clk),
     .clk_o(clocks),
     .locked(clk_sdram_locked)
   );
@@ -172,13 +144,78 @@ module sms
   wire clk_sdram = clocks[2];
   wire sdram_clk = clocks[3]; // phase shifted for chip
 
+  wire clk_usb_locked;
+  wire [3:0] clock_usb;
+  ecp5pll
+  #(
+      .in_hz( 25*1000000),
+    .out0_hz(100*1000000),
+    .out1_hz( 12*1000000)
+  )
+  ecp5pll_usb
+  (
+    .clk_i(clk_vga),
+    .clk_o(clock_usb),
+    .locked(clk_usb_locked)
+  );
+  wire clk_usb  = clock_usb[1];
+
   // ===============================================================
-  // Joystick for OSD control and games
+  // USB joystick for OSD control and games
   // ===============================================================
+  assign usb_pull_dp = 2'b0;
+  assign usb_pull_dn = 2'b0;
+
+  wire [1:0] usb_type;
+  wire [7:0] key_modifiers, key1, key2, key3, key4;
+  wire [7:0] mouse_btn;
+  wire usb_report, usb_conerr, game_l, game_r, game_u, game_d, game_a, game_b, game_x, game_y;
+  wire signed [7:0] mouse_dx, mouse_dy;
+  wire game_sel, game_sta;
+
+  reg key_w, key_a, key_s, key_d, key_x, key_y, key_s;
+
+  always @(*) begin
+      // WASD
+      // https://gist.github.com/MightyPork/6da26e382a7ad91b5496ee55fdc73db2
+      key_w = (key1 == 8'h1a | key2 == 8'h1a | key3 == 8'h1a | key4 == 8'h1a);
+      key_a = (key1 == 8'h04 | key2 == 8'h04 | key3 == 8'h04 | key4 == 8'h04);
+      key_s = (key1 == 8'h16 | key2 == 8'h16 | key3 == 8'h16 | key4 == 8'h16);
+      key_d = (key1 == 8'h07 | key2 == 8'h07 | key3 == 8'h07 | key4 == 8'h07);
+      key_x = (key1 == 8'h1b | key2 == 8'h1b | key3 == 8'h1b | key4 == 8'h1b) |
+              (key1 == 8'h0e | key2 == 8'h0e | key3 == 8'h0e | key4 == 8'h0e); // or k==x l==y
+      key_y = (key1 == 8'h1c | key2 == 8'h1c | key3 == 8'h1c | key4 == 8'h1c) |
+              (key1 == 8'h0f | key2 == 8'h0f | key3 == 8'h0f | key4 == 8'h0f);
+      key_s = (key1 == 8'h13 | key2 == 8'h13 | key3 == 8'h13 | key4 == 8'h13);
+  end
+
+  wire [6:0] joy_buttons = // RIGHT LEFT DOWN UP FIRE1 FIRE2
+      (usb_type == 1) ? {key_d, key_a, key_s, key_w, key_x, key_y, key_s | button[0]} : // Keeb
+     ((usb_type == 2) ? {mouse_btn[1], mouse_btn[0], |mouse_dx, ~button[1], mouse_btn[2], |mouse_dy, button[0]} : // Mouse
+     ((usb_type == 3) ? {game_r, game_l, game_d, game_u, game_a | game_x, game_b | game_y, game_sel | button[0]} : // Gamepad
+                        {5'b0, ~button[1], button[0]}));  // None
+  
+  usb_hid_host usb (
+      .usbclk(clk_usb), .usbrst_n(clk_usb_locked),
+      .usb_dm(usb_dn[0]), .usb_dp(usb_dp[0]),
+      .typ(usb_type), .report(usb_report),
+      .key_modifiers(key_modifiers), .key1(key1), .key2(key2), .key3(key3), .key4(key4),
+      .mouse_btn(mouse_btn), .mouse_dx(mouse_dx), .mouse_dy(mouse_dy),
+      .game_l(game_l), .game_r(game_r), .game_u(game_u), .game_d(game_d),
+      .game_a(game_a), .game_b(game_b), .game_x(game_x), .game_y(game_y), 
+      .game_sel(game_sel), .game_sta(game_sta),
+      .conerr(usb_conerr)
+  );
+  
+  reg report_toggle;      // blinks whenever there's a report
+  always @(posedge clk_usb) if (usb_report) report_toggle <= ~report_toggle;
+
   reg joypad2 = 0;
   reg [6:0] R_btn_joy;
   always @(posedge cpuClock)
-    R_btn_joy <= btn;
+    R_btn_joy <= joy_buttons;
+
+  assign led = {R_btn_joy[2], mouse_btn[0], usb_type==2, joy_buttons[2]}; // mode
 
   // ===============================================================
   // SPI Slave for RAM and CPU control
@@ -188,10 +225,14 @@ module sms
   wire  [7:0] spi_ram_di;
   wire  [7:0] spi_ram_do = ramOut;
 
-  assign sd_d[0] = 1'bz;
-  assign sd_d[3] = 1'bz; // FPGA pin pullup sets SD card inactive at SPI bus
+  assign sd_dat[0] = 1'bz;
+  assign sd_dat[3] = 1'bz; // FPGA pin pullup sets SD card inactive at SPI bus
 
-  wire irq;
+  wire spi_miso, spi_irq;
+
+  assign pi_miso = spi_miso;
+  assign pi_nirq = ~spi_irq;
+
   spi_ram_btn
   #(
     .c_sclk_capable_pin(1'b0),
@@ -200,20 +241,18 @@ module sms
   spi_ram_btn_inst
   (
     .clk(cpuClock),
-    .csn(~wifi_gpio5),
-    .sclk(wifi_gpio16),
-    .mosi(sd_d[1]), // wifi_gpio4
-    .miso(sd_d[2]), // wifi_gpio12
+    .csn(~pi_ce0),
+    .sclk(pi_sclk),
+    .mosi(pi_mosi), // wifi_gpio4
+    .miso(spi_miso), // wifi_gpio12
     .btn(R_btn_joy),
-    .irq(irq),
+    .irq(spi_irq),
     .wr(spi_ram_wr),
     .rd(spi_ram_rd),
     .addr(spi_ram_addr),
     .data_in(spi_ram_do),
     .data_out(spi_ram_di)
   );
-  // Used for interrupt to ESP32
-  assign wifi_gpio0 = ~irq;
 
   reg [7:0] R_cpu_control;
   always @(posedge cpuClock) begin
@@ -240,7 +279,7 @@ module sms
   
   reg n_hard_reset;
   always @(posedge cpuClock)
-    n_hard_reset <= pwr_up_reset_n & btn[0] & ~R_cpu_control[0];
+    n_hard_reset <= pwr_up_reset_n & button[0] & ~R_cpu_control[0];
 
   wire reset = !n_hard_reset;
 
@@ -283,8 +322,8 @@ module sms
                     cpuAddress[15:14] == 1 ? {slot1, cpuAddress[13:0]} :
                     cpuAddress[15:14] == 2 ? {slot2, cpuAddress[13:0]} : cpuAddress;
 
-  assign sdram_d = sdram_d_wr ? sdram_d_out : 16'hzzzz;
-  assign sdram_d_in = sdram_d;
+  assign sdram_dq = sdram_d_wr ? sdram_d_out : 16'hzzzz;
+  assign sdram_d_in = sdram_dq;
   sdram
   sdram_i
   (
@@ -473,7 +512,7 @@ module sms
     .i_g(green),
     .i_b(blue ),
     .i_hsync(~hSync), .i_vsync(~vSync), .i_blank(~vga_de),
-    .i_csn(~wifi_gpio5), .i_sclk(wifi_gpio16), .i_mosi(sd_d[1]), // .o_miso(),
+    .i_csn(~pi_ce0), .i_sclk(pi_sclk), .i_mosi(pi_mosi), .o_miso(pi_miso),
     .o_r(osd_vga_r), .o_g(osd_vga_g), .o_b(osd_vga_b),
     .o_hsync(osd_vga_hsync), .o_vsync(osd_vga_vsync), .o_blank(osd_vga_blank)
   );
@@ -482,6 +521,14 @@ module sms
   HDMI_out vga2dvid (
     .pixclk(clk_vga),
     .pixclk_x5(clk_hdmi),
+    .red  (osd_vga_r),
+    /*
+    .green(green),
+    .blue (blue),
+    .vde  (vga_de),
+    .hSync(hSync),
+    .vSync(vSync),
+    */
     .red  (osd_vga_r),
     .green(osd_vga_g),
     .blue (osd_vga_b),
@@ -556,6 +603,7 @@ module sms
   // ===============================================================
   // Audio
   // ===============================================================
+  /*
   wire [13:0] audio_dout;
   wire aud_l, aud_r;
   wire sound_ready;
@@ -579,86 +627,13 @@ module sms
     .left(aud_l),
     .right(aud_r)
   );
-
-  assign audio_l = aud_l ? c_volume : 0;
-  assign audio_r = audio_l;
-
-  // ===============================================================
-  // Diagnostic LCD 
-  // ===============================================================
-
-  generate
-  if(c_lcd_hex)
-  begin
-  // SPI DISPLAY
-  reg [127:0] R_display;
-  // HEX decoder does printf("%16X\n%16X\n", R_display[63:0], R_display[127:64]);
-  always @(posedge cpuClock)
-    R_display = {r_vdp[0], r_vdp[1], r_vdp[2], r_vdp[3], r_vdp[4], r_vdp[5],
-                 r_vdp[6], r_vdp[7], r_vdp[8], r_vdp[9], r_vdp[10]};
-
-  parameter C_color_bits = 16;
-  wire [7:0] x;
-  wire [7:0] y;
-  wire [C_color_bits-1:0] color;
-  hex_decoder_v
-  #(
-    .c_data_len(128),
-    .c_row_bits(4),
-    .c_grid_6x8(1), // NOTE: TRELLIS needs -abc9 option to compile
-    .c_font_file("hex_font.mem"),
-    .c_color_bits(C_color_bits)
-  )
-  hex_decoder_v_inst
-  (
-    .clk(clk_hdmi),
-    .data(R_display),
-    .x(x[7:1]),
-    .y(y[7:1]),
-    .color(color)
-  );
-
-  // allow large combinatorial logic
-  // to calculate color(x,y)
-  wire next_pixel;
-  reg [C_color_bits-1:0] R_color;
-  always @(posedge clk_hdmi)
-    if(next_pixel)
-      R_color <= color;
-
-  wire w_oled_csn;
-  lcd_video
-  #(
-    .c_clk_mhz(125),
-    .c_init_file("st7789_linit_xflip.mem"),
-    .c_clk_phase(0),
-    .c_clk_polarity(1),
-    .c_init_size(38)
-  )
-  lcd_video_inst
-  (
-    .clk(clk_hdmi),
-    .reset(R_btn_joy[5]),
-    .x(x),
-    .y(y),
-    .next_pixel(next_pixel),
-    .color(R_color),
-    .spi_clk(oled_clk),
-    .spi_mosi(oled_mosi),
-    .spi_dc(oled_dc),
-    .spi_resn(oled_resn),
-    .spi_csn(w_oled_csn)
-  );
-  //assign oled_csn = w_oled_csn; // 8-pin ST7789: oled_csn is connected to CSn
-  assign oled_csn = 1; // 7-pin ST7789: oled_csn is connected to BLK (backlight enable pin)
-  end
-  endgenerate
+  */
 
   // ===============================================================
   // Leds
   // ===============================================================
-  assign led = {pc[15:14], !n_hard_reset, mode};
-
+  // assign led = {R_btn_joy[2], pi_ce0, report_toggle, reset}; // mode
+    
   always @(posedge cpuClock) diag16 <= {r_vdp[0], r_vdp[1]};
 
 endmodule
