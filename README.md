@@ -32,7 +32,7 @@ Top-level parameters allow the VGA output to be selected, and also LCD and LED d
 
 ## Installation
 
-You need recent versions of oss cad suit.
+You need recent versions of oss cad suite.
 
 To build do:
 
